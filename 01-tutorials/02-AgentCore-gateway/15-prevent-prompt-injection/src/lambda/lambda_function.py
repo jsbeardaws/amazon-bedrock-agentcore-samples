@@ -1,152 +1,222 @@
 """
-Prompt Injection Prevention Interceptor for Gateway MCP REQUESTS using Bedrock Guardrails
+SQL Injection Prevention Interceptor for Gateway MCP REQUESTS
 
 This Lambda function intercepts Gateway MCP tools/call REQUESTS and analyzes
-user prompts for injection attacks using Amazon Bedrock Guardrails before allowing
-requests to reach tools. It is configured as a REQUEST interceptor.
+TOOL ARGUMENTS (not user prompts) for SQL injection attacks before allowing 
+requests to reach database tools. It is configured as a REQUEST interceptor.
 
-This implementation uses Bedrock Guardrails' prompt attack detection capabilities
-to identify and block malicious prompts including jailbreak attempts, prompt injection,
-and other adversarial inputs.
+IMPORTANT: This protects at the TOOL LEVEL, not the agent level.
+- Agent-level: Bedrock Guardrails protects the agent from prompt injection
+- Tool-level: This interceptor protects database tools from SQL injection
 
-Security: Fails CLOSED - blocks requests if Guardrails analysis fails or detects threats.
+The agent has already processed the user prompt by the time it calls a tool.
+This interceptor analyzes the tool's query arguments to prevent SQL injection
+before any database query executes.
+
+DETECTION APPROACH:
+This is a DEMO using heuristic pattern matching to detect common SQL injection
+patterns. In production, the recommended deterministic control is to:
+1. Disallow raw SQL in tool arguments
+2. Require structured query templates or query builders
+3. Use parameterized execution at the database layer
+
+This heuristic detector identifies high-signal SQL injection indicators:
+- Statement stacking (;) followed by SQL keywords
+- Comment tokens (--, /*, */)
+- UNION + SELECT combinations
+- Tautologies (OR 1=1, AND 1=1)
+- Time-based injection (SLEEP, WAITFOR DELAY, BENCHMARK)
+
+Security: Fails CLOSED - blocks requests if SQL injection patterns are detected.
 """
 
 import json
-import os
-import boto3
-from typing import Any, Dict, Tuple
+import re
+import hashlib
+from typing import Any, Dict, Tuple, List
 
-# Initialize Bedrock Runtime client
-bedrock_runtime = boto3.client('bedrock-runtime')
+# Configuration
+STRICT_MODE = False  # If True, deny any raw SQL fields; if False, run heuristics
+MAX_STRING_LENGTH = 10000  # Reject extremely long strings to avoid regex worst cases
 
-# Get Guardrail configuration from environment variables
-GUARDRAIL_ID = os.environ.get('GUARDRAIL_ID')
-GUARDRAIL_VERSION = os.environ.get('GUARDRAIL_VERSION', 'DRAFT')
+# High-signal SQL Injection Detection Patterns
+# These patterns focus on clear SQL injection indicators with low false positive rates
+SQL_INJECTION_PATTERNS = [
+    # Statement stacking - semicolon followed by SQL keywords
+    (r';[\s\n]*\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE)\b', 'STACKED_QUERY'),
+    
+    # SQL Comments - clear injection indicators
+    (r'--', 'SQL_COMMENT_DASH'),
+    (r'/\*', 'SQL_COMMENT_OPEN'),
+    (r'\*/', 'SQL_COMMENT_CLOSE'),
+    
+    # UNION-based injection
+    (r'\bUNION\b[\s\n]+\bSELECT\b', 'UNION_SELECT'),
+    (r'\bUNION\b[\s\n]+\bALL\b[\s\n]+\bSELECT\b', 'UNION_ALL_SELECT'),
+    
+    # Tautologies - always-true conditions
+    (r'\bOR\b[\s\n]+1[\s\n]*=[\s\n]*1', 'TAUTOLOGY_OR'),
+    (r'\bAND\b[\s\n]+1[\s\n]*=[\s\n]*1', 'TAUTOLOGY_AND'),
+    
+    # Time-based blind injection
+    (r'\bSLEEP\b[\s\n]*\(', 'TIME_SLEEP'),
+    (r'\bWAITFOR\b[\s\n]+\bDELAY\b', 'TIME_WAITFOR'),
+    (r'\bBENCHMARK\b[\s\n]*\(', 'TIME_BENCHMARK'),
+]
 
-def analyze_prompt_with_guardrails(user_query: str) -> Tuple[bool, str]:
+# Advanced patterns (optional, higher false positive rate)
+# Uncomment to enable more aggressive detection
+ADVANCED_PATTERNS = [
+    # Dangerous keywords (can have legitimate uses in admin tools)
+    # (r'\bDROP\b[\s\n]+\bTABLE\b', 'DROP_TABLE'),
+    # (r'\bDELETE\b[\s\n]+\bFROM\b', 'DELETE_FROM'),
+    # (r'\bTRUNCATE\b[\s\n]+\bTABLE\b', 'TRUNCATE_TABLE'),
+    
+    # Information schema (normal in admin queries)
+    # (r'\binformation_schema\b', 'INFO_SCHEMA'),
+    # (r'\bsys\.', 'SYS_SCHEMA'),
+    
+    # Hex encoding (normal for binary data)
+    # (r'0x[0-9a-fA-F]{4,}', 'HEX_ENCODING'),
+]
+
+# Compile patterns for efficiency
+COMPILED_PATTERNS = [(re.compile(pattern, re.IGNORECASE | re.MULTILINE), rule_id) 
+                     for pattern, rule_id in SQL_INJECTION_PATTERNS]
+
+
+def normalize_string(s: str) -> str:
     """
-    Use Amazon Bedrock Guardrails to analyze user prompt for injection attacks.
+    Normalize a string for SQL injection detection.
+    - Collapse repeated whitespace
+    - Convert to lowercase for case-insensitive matching
+    """
+    # Collapse whitespace (spaces, tabs, newlines) to single space
+    normalized = re.sub(r'\s+', ' ', s)
+    return normalized.lower()
+
+
+def compute_query_hash(query: str) -> str:
+    """
+    Compute a short hash of the query for correlation without logging sensitive data.
+    """
+    return hashlib.sha256(query.encode()).hexdigest()[:16]
+
+
+def extract_all_strings(obj: Any, path: str = "") -> List[Tuple[str, str]]:
+    """
+    Recursively extract all string values from a nested structure.
+    Returns list of (path, value) tuples for logging which field triggered detection.
     
     Args:
-        user_query: The user's input query to analyze
+        obj: Object to scan (dict, list, or primitive)
+        path: Current path in the object tree (for logging)
     
     Returns:
-        Tuple of (is_safe: bool, reason: str)
-        - is_safe: True if query is safe, False if injection detected
-        - reason: Explanation of the security decision
+        List of (path, string_value) tuples
     """
-    print(f"[DEBUG] analyze_prompt_with_guardrails - INPUT query (first 200 chars): {user_query[:200]}")
+    strings = []
     
-    if not GUARDRAIL_ID:
-        print("[DEBUG] WARNING: GUARDRAIL_ID not configured, blocking request (fail-closed)")
-        print(f"[DEBUG] analyze_prompt_with_guardrails - RETURNING False (no guardrail)")
-        return False, "Guardrail not configured"
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            new_path = f"{path}.{key}" if path else key
+            strings.extend(extract_all_strings(value, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            strings.extend(extract_all_strings(item, new_path))
+    elif isinstance(obj, str):
+        strings.append((path, obj))
     
-    try:
-        print(f"[DEBUG] Calling Bedrock Guardrails API with ID: {GUARDRAIL_ID}, Version: {GUARDRAIL_VERSION}")
-        
-        # Apply guardrail to the user input
-        response = bedrock_runtime.apply_guardrail(
-            guardrailIdentifier=GUARDRAIL_ID,
-            guardrailVersion=GUARDRAIL_VERSION,
-            source='INPUT',  # We're filtering user input
-            content=[{
-                'text': {
-                    'text': user_query
-                }
-            }]
-        )
-        
-        print(f"[DEBUG] Guardrails API response received: {json.dumps(response, default=str)}")
-        
-        # Check the action taken by the guardrail
-        action = response.get('action', 'NONE')
-        print(f"[DEBUG] Guardrail action: {action}")
-        
-        if action == 'GUARDRAIL_INTERVENED':
-            # Guardrail detected a threat
-            print(f"[DEBUG] Threat detected by Guardrails")
-            
-            # Extract details about what was detected
-            assessments = response.get('assessments', [])
-            reasons = []
-            
-            if assessments:
-                for assessment in assessments:
-                    # Check for prompt attack detection
-                    prompt_attack = assessment.get('promptAttack', {})
-                    if prompt_attack:
-                        detected_types = []
-                        if prompt_attack.get('jailbreak'):
-                            detected_types.append('jailbreak attempt')
-                        if prompt_attack.get('promptInjection'):
-                            detected_types.append('prompt injection')
-                        
-                        if detected_types:
-                            reasons.append(f"Detected: {', '.join(detected_types)}")
-                            print(f"[DEBUG]   Detected threat types: {', '.join(detected_types)}")
-                    
-                    # Check for other policy violations
-                    content_policy = assessment.get('contentPolicy', {})
-                    if content_policy.get('filters'):
-                        for filter_item in content_policy['filters']:
-                            if filter_item.get('action') == 'BLOCKED':
-                                filter_type = filter_item.get('type', 'unknown')
-                                reasons.append(f"Content policy violation: {filter_type}")
-                                print(f"[DEBUG]   Content policy violation: {filter_type}")
-            
-            reason = '; '.join(reasons) if reasons else "Potential security threat detected"
-            print(f"[DEBUG] analyze_prompt_with_guardrails - RETURNING False (threat detected)")
-            return False, reason
-        
-        elif action == 'NONE':
-            # No intervention needed - query is safe
-            print(f"[DEBUG] No threats detected by Guardrails")
-            print(f"[DEBUG] analyze_prompt_with_guardrails - RETURNING True (safe)")
-            return True, "Query passed security analysis"
-        
-        else:
-            # Unexpected action - fail closed
-            print(f"[DEBUG] WARNING: Unexpected guardrail action: {action}")
-            print(f"[DEBUG] analyze_prompt_with_guardrails - RETURNING False (unexpected action)")
-            return False, f"Unexpected security response: {action}"
-        
-    except Exception as e:
-        # Fail CLOSED: Block on any error for security
-        error_message = str(e)
-        print(f"[DEBUG] ERROR applying Guardrails: {error_message}")
-        print(f"[DEBUG]   Guardrail ID: {GUARDRAIL_ID}")
-        print(f"[DEBUG]   Guardrail Version: {GUARDRAIL_VERSION}")
-        
-        # Check if it's a validation error about guardrail not existing
-        if 'does not exist' in error_message or 'ValidationException' in error_message:
-            print("[DEBUG]   ⚠ The Guardrail ID or version is invalid or doesn't exist")
-            print("[DEBUG]   ⚠ Make sure Step 1.3 was run successfully to create the Guardrail")
-            print("[DEBUG]   ⚠ Verify the Lambda environment variables are set correctly")
-        
-        # On error, block request (fail closed for security)
-        print(f"[DEBUG] analyze_prompt_with_guardrails - RETURNING False (error occurred)")
-        return False, f"Security analysis failed: {error_message[:100]}"
+    return strings
 
-def create_blocked_response(reason: str, request_id: Any, request_headers: Dict[str, Any]) -> Dict[str, Any]:
+
+def detect_sql_injection(value: str, field_path: str = "") -> Tuple[bool, str, str]:
+    """
+    Detect SQL injection patterns in a string value.
+    
+    Args:
+        value: The string value to analyze
+        field_path: Path to this field in the arguments (for logging)
+    
+    Returns:
+        Tuple of (is_malicious: bool, rule_id: str, category: str)
+        - is_malicious: True if SQL injection detected, False if safe
+        - rule_id: Identifier of the matched rule (for internal logging)
+        - category: Coarse category for caller (e.g., "SQL_INJECTION_DETECTED")
+    """
+    if not value:
+        return False, "", ""
+    
+    # Reject extremely long strings early
+    if len(value) > MAX_STRING_LENGTH:
+        return True, "STRING_TOO_LONG", "INVALID_INPUT"
+    
+    # Normalize for detection
+    normalized = normalize_string(value)
+    
+    # Check each pattern
+    for pattern, rule_id in COMPILED_PATTERNS:
+        if pattern.search(normalized):
+            return True, rule_id, "SQL_INJECTION_DETECTED"
+    
+    return False, "", ""
+
+
+def analyze_arguments_for_sql_injection(arguments: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """
+    Analyze all tool arguments for SQL injection attacks.
+    Recursively scans all string values in the arguments structure.
+    
+    IMPORTANT: This analyzes the tool's arguments, NOT the original user prompt.
+    The agent has already processed the user prompt. We're protecting the database
+    tool from SQL injection by analyzing all string parameters before execution.
+    
+    Args:
+        arguments: The tool's arguments dict to analyze for SQL injection
+    
+    Returns:
+        Tuple of (is_safe: bool, rule_id: str, category: str)
+        - is_safe: True if arguments are safe, False if SQL injection detected
+        - rule_id: Internal rule identifier (for logging only)
+        - category: Coarse category for caller
+    """
+    # Extract all strings from arguments
+    all_strings = extract_all_strings(arguments)
+    
+    if not all_strings:
+        return True, "", ""
+    
+    # Check each string value
+    for field_path, value in all_strings:
+        is_malicious, rule_id, category = detect_sql_injection(value, field_path)
+        
+        if is_malicious:
+            # Log detection without exposing the actual content
+            value_hash = compute_query_hash(value)
+            print(f"[SECURITY] SQL injection detected | field={field_path} | rule={rule_id} | hash={value_hash}")
+            return False, rule_id, category
+    
+    return True, "", ""
+
+def create_blocked_response(category: str, request_id: Any) -> Dict[str, Any]:
     """
     Create an MCP error response for blocked requests.
     
     For REQUEST interceptors, when blocking a request, we return a transformedGatewayResponse
     to short-circuit the request and send an error back to the client without calling the target.
     
+    SECURITY: Returns only generic error message to caller. Detailed rule_id is logged only.
+    
     Args:
-        reason: Explanation for why request was blocked
+        category: Coarse category (e.g., "SQL_INJECTION_DETECTED", "INVALID_INPUT")
         request_id: Original request ID from MCP request
-        request_headers: Original request headers
     
     Returns:
         Interceptor response with transformedGatewayResponse containing error
     """
-    print(f"[DEBUG] create_blocked_response - Creating blocked response")
-    print(f"[DEBUG]   Request ID: {request_id}")
-    print(f"[DEBUG]   Reason: {reason}")
+    # Generic message - do not expose detection details to caller
+    generic_message = "Request blocked by security policy"
     
     blocked_response = {
         "interceptorOutputVersion": "1.0",
@@ -162,10 +232,10 @@ def create_blocked_response(reason: str, request_id: Any, request_headers: Dict[
                     "id": request_id,
                     "error": {
                         "code": -32000,  # Server error code
-                        "message": "Request blocked by security interceptor",
+                        "message": generic_message,
                         "data": {
-                            "reason": reason,
-                            "security_policy": "prompt_injection_prevention"
+                            "category": category,
+                            "security_policy": "sql_injection_prevention"
                         }
                     }
                 }
@@ -173,7 +243,6 @@ def create_blocked_response(reason: str, request_id: Any, request_headers: Dict[
         }
     }
     
-    print(f"[DEBUG] create_blocked_response - RETURNING blocked response")
     return blocked_response
 
 
@@ -181,8 +250,13 @@ def lambda_handler(event, context):
     """
     Main Lambda handler for Gateway REQUEST interceptor.
     
-    This handler analyzes incoming tool requests for prompt injection attacks
-    before they reach the target tools using Bedrock Guardrails.
+    This handler analyzes incoming tool requests for SQL injection attacks
+    before they reach the database tools.
+    
+    IMPORTANT: This protects at the TOOL LEVEL by analyzing tool arguments.
+    - The agent has already processed the user prompt
+    - We're analyzing the tool's arguments for SQL injection
+    - This prevents malicious queries from reaching the database
     
     Expected event structure (from Gateway REQUEST for tools/call):
     {
@@ -196,7 +270,7 @@ def lambda_handler(event, context):
                     "id": "request-id",
                     "params": {
                         "name": "tool-name",
-                        "arguments": {"query": "user input here"}
+                        "arguments": {"query": "SELECT * FROM customers WHERE id = 123"}
                     }
                 }
             }
@@ -205,129 +279,76 @@ def lambda_handler(event, context):
     
     Returns either:
     - Original request (if safe) to proceed to tool
-    - Blocked error response (if unsafe or analysis fails)
+    - Blocked error response (if SQL injection detected or analysis fails)
     """
-    print(f"[DEBUG] ========== LAMBDA HANDLER START ==========")
-    print(f"[DEBUG] Prompt Injection Prevention Interceptor - Received event: {json.dumps(event, default=str)}")
-    
     try:
         # Extract MCP data
         mcp_data = event.get('mcp', {})
-        print(f"[DEBUG] Extracted mcp_data: {json.dumps(mcp_data, default=str)}")
-        
         gateway_request = mcp_data.get('gatewayRequest', {})
-        print(f"[DEBUG] Extracted gateway_request: {json.dumps(gateway_request, default=str)}")
-        
-        # Get request data
-        request_headers = gateway_request.get('headers', {})
-        print(f"[DEBUG] request_headers: {request_headers}")
-        
         request_body = gateway_request.get('body', {})
-        print(f"[DEBUG] request_body: {json.dumps(request_body, default=str)}")
         
         method = request_body.get('method', '')
-        print(f"[DEBUG] Method: {method}")
-        
         request_id = request_body.get('id', 'unknown')
-        print(f"[DEBUG] Request ID: {request_id}")
+        
+        # Log minimal info - no PII, no tokens, no SQL
+        print(f"[INFO] Interceptor invoked | request_id={request_id} | method={method}")
         
         # Only analyze tools/call requests
         if method != 'tools/call':
-            print(f"[DEBUG] Method is not 'tools/call', passing through unchanged")
-            
-            passthrough_obj = {
+            print(f"[INFO] Method not tools/call, passing through | request_id={request_id}")
+            return {
                 "interceptorOutputVersion": "1.0",
                 "mcp": {
                     "transformedGatewayRequest": {
-                        "headers": request_headers,
+                        "headers": gateway_request.get('headers', {}),
                         "body": request_body
                     }
                 }
             }
-            
-            print(f"[DEBUG] lambda_handler - RETURNING (passthrough): {json.dumps(passthrough_obj, default=str)}")
-            print(f"[DEBUG] ========== LAMBDA HANDLER END (passthrough) ==========")
-            return passthrough_obj
         
         # Extract tool call parameters
         params = request_body.get('params', {})
         tool_name = params.get('name', '')
         arguments = params.get('arguments', {})
         
-        print(f"[DEBUG] Tool called: {tool_name}")
-        print(f"[DEBUG] Arguments: {json.dumps(arguments, default=str)}")
+        print(f"[INFO] Analyzing tool call | request_id={request_id} | tool={tool_name}")
         
-        # Extract user query from arguments
-        # Adjust this based on your tool's argument structure
-        user_query = arguments.get('query', '')
+        # STRICT MODE: Deny any raw SQL fields
+        if STRICT_MODE:
+            # Check if arguments contain raw SQL field
+            if 'query' in arguments or 'sql' in arguments:
+                print(f"[SECURITY] STRICT MODE: Raw SQL field rejected | request_id={request_id} | tool={tool_name}")
+                return create_blocked_response("RAW_SQL_NOT_ALLOWED", request_id)
         
-        if not user_query:
-            print(f"[DEBUG] No 'query' argument found, passing through")
-            
-            passthrough_obj = {
-                "interceptorOutputVersion": "1.0",
-                "mcp": {
-                    "transformedGatewayRequest": {
-                        "headers": request_headers,
-                        "body": request_body
-                    }
-                }
-            }
-            
-            print(f"[DEBUG] lambda_handler - RETURNING (no query): {json.dumps(passthrough_obj, default=str)}")
-            print(f"[DEBUG] ========== LAMBDA HANDLER END (no query) ==========")
-            return passthrough_obj
-        
-        print(f"[DEBUG] Analyzing user query for injection attacks...")
-        
-        # Analyze query with Bedrock Guardrails
-        is_safe, reason = analyze_prompt_with_guardrails(user_query)
+        # Analyze all string arguments for SQL injection
+        is_safe, rule_id, category = analyze_arguments_for_sql_injection(arguments)
         
         if is_safe:
-            print(f"[DEBUG] Query is SAFE - allowing request to proceed")
-            print(f"[DEBUG] Reason: {reason}")
+            print(f"[INFO] Request allowed | request_id={request_id} | tool={tool_name}")
             
             # Pass through original request unchanged
-            safe_obj = {
+            return {
                 "interceptorOutputVersion": "1.0",
                 "mcp": {
                     "transformedGatewayRequest": {
-                        "headers": request_headers,
+                        "headers": gateway_request.get('headers', {}),
                         "body": request_body
                     }
                 }
             }
-            
-            print(f"[DEBUG] lambda_handler - RETURNING (safe): {json.dumps(safe_obj, default=str)}")
-            print(f"[DEBUG] ========== LAMBDA HANDLER END (safe) ==========")
-            return safe_obj
         else:
-            print(f"[DEBUG] Query is UNSAFE - BLOCKING request")
-            print(f"[DEBUG] Reason: {reason}")
+            print(f"[SECURITY] Request blocked | request_id={request_id} | tool={tool_name} | rule={rule_id}")
             
-            # Return blocked error response
-            blocked_obj = create_blocked_response(reason, request_id, request_headers)
-            
-            print(f"[DEBUG] lambda_handler - RETURNING (blocked): {json.dumps(blocked_obj, default=str)}")
-            print(f"[DEBUG] ========== LAMBDA HANDLER END (blocked) ==========")
-            return blocked_obj
+            # Return blocked error response (generic message to caller)
+            return create_blocked_response(category, request_id)
     
     except Exception as e:
-        print(f"[DEBUG] ERROR in lambda_handler: {e}")
-        
-        import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
-        
         # Fail CLOSED: Block on any unexpected error
-        print(f"[DEBUG] BLOCKING request due to interceptor error (fail-closed)")
+        print(f"[ERROR] Interceptor error | request_id={request_body.get('id', 'unknown')} | error={str(e)[:100]}")
         
-        error_obj = create_blocked_response(
-            f"Interceptor error: {str(e)[:100]}",
-            request_body.get('id', 'unknown'),
-            gateway_request.get('headers', {})
+        # Block request with generic error
+        return create_blocked_response(
+            "INTERCEPTOR_ERROR",
+            request_body.get('id', 'unknown')
         )
-        
-        print(f"[DEBUG] lambda_handler - RETURNING (error): {json.dumps(error_obj, default=str)}")
-        print(f"[DEBUG] ========== LAMBDA HANDLER END (error) ==========")
-        return error_obj
 
